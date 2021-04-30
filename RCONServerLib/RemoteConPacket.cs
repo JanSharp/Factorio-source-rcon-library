@@ -18,8 +18,6 @@ namespace RCONServerLib
             Auth = 3
         }
 
-        private const int MaxAllowedPacketSize = 4096;
-
         /// <summary>
         ///     The identifier of the packet
         ///     (It need not be unique, but if a unique packet id is assigned,
@@ -49,7 +47,7 @@ namespace RCONServerLib
         /// </summary>
         private readonly Encoding _packetEncoding = Encoding.ASCII;
 
-        public RemoteConPacket(byte[] packetBytes, bool useUTF8 = false)
+        public RemoteConPacket(byte[] packetBytes, bool useUTF8 = false, int? size = null)
         {
             if (useUTF8)
                 _packetEncoding = Encoding.UTF8;
@@ -58,10 +56,10 @@ namespace RCONServerLib
             {
                 using (var reader = new BinaryReaderExt(ms))
                 {
-                    Size = reader.ReadInt32LittleEndian();
+                    Size = size ?? reader.ReadInt32LittleEndian();
 
                     // The size field (4-Bytes Little Endian Int) is, according to specification, not included.
-                    if (Size + 4 != packetBytes.Length)
+                    if (Size + (size.HasValue ? 0 : 4) != packetBytes.Length)
                         throw new LengthMismatchException("packet length mismatch");
 
                     Id = reader.ReadInt32LittleEndian();
@@ -103,8 +101,6 @@ namespace RCONServerLib
             Payload = payload;
             Id = id;
             Type = type;
-            if (Length > MaxAllowedPacketSize)
-                throw new PacketTooLongException();
         }
 
         /// <summary>

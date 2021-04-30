@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
 using RCONServerLib.Utils;
 
 namespace RCONServerLib
@@ -38,7 +40,7 @@ namespace RCONServerLib
             ConnectionLost
         }
 
-        private const int MaxAllowedPacketSize = 4096;
+        private const int ReadFixedAmountTimeoutMs = 10 * 1000;
 
         /// <summary>
         ///     The TCP Client
@@ -51,10 +53,10 @@ namespace RCONServerLib
         private readonly Dictionary<int, CommandResult> _requestedCommands;
 
         /// <summary>
-        ///     A buffer containing the packet
+        ///     A buffer containing the size of the packet
         /// </summary>
-        private byte[] _buffer;
-
+        private byte[] _sizeBuffer;
+        
         /// <summary>
         ///     Underlaying NetworkStream
         /// </summary>
@@ -65,6 +67,11 @@ namespace RCONServerLib
         /// </summary>
         private int _packetId;
 
+        /// <summary>
+        /// the <see cref="CancellationTokenSource"/> used to cancel the network stream reading loop
+        /// </summary>
+        private CancellationTokenSource _nsReadTaskCancellationTokenSource;
+        
         /// <summary>
         ///     If the client is authenticated
         /// </summary>
@@ -117,7 +124,7 @@ namespace RCONServerLib
         /// <param name="port">The port to connect to</param>
         public void Connect(string hostname, int port)
         {
-            Log(string.Format("Connecting to {0}:{1}", hostname, port));
+            Log($"Connecting to {hostname}:{port}");
             try
             {
                 IAsyncResult ar = null;
@@ -134,16 +141,13 @@ namespace RCONServerLib
                     }
                     catch (Exception e)
                     {
-                        Log("Unknown Exception");
+                        Log($"Unknown/Unexpected exception:\n{e}");
                     }
                 }
                 ar.AsyncWaitHandle.WaitOne(2000); // wait 2 seconds
                 if (!ar.IsCompleted)
                 {
-                    if (OnConnectionStateChange != null)
-                    {
-                        OnConnectionStateChange(ConnectionStateChange.NoConnection);
-                    }
+                    OnConnectionStateChange?.Invoke(ConnectionStateChange.NoConnection);
                     _client.Client.Close();
                 }
             }
@@ -160,14 +164,12 @@ namespace RCONServerLib
             if (!_client.Connected) return;
             _ns = _client.GetStream();
 
-            // As indicated by specification the maximum packet size is 4096
-            // NOTE: Not sure if only the server is allowed to sent packets with max 4096 or both parties!
-            _buffer = new byte[MaxAllowedPacketSize];
-            _ns.BeginRead(_buffer, 0, MaxAllowedPacketSize, OnPacket, null);
+            _sizeBuffer = new byte[4];
+            _nsReadTaskCancellationTokenSource = new CancellationTokenSource();
+            _ = ListenToNetworkStreamAsync(_nsReadTaskCancellationTokenSource.Token);
 
             Log("Connected.");
-            if (OnConnectionStateChange != null)
-                OnConnectionStateChange(ConnectionStateChange.Connected);
+            OnConnectionStateChange?.Invoke(ConnectionStateChange.Connected);
         }
 
         /// <summary>
@@ -176,8 +178,7 @@ namespace RCONServerLib
         /// <param name="message"></param>
         private void Log(string message)
         {
-            if (OnLog != null)
-                OnLog(message);
+            OnLog?.Invoke(message);
         }
 
         /// <summary>
@@ -187,9 +188,9 @@ namespace RCONServerLib
         {
             if (_client.Connected)
             {
+                _nsReadTaskCancellationTokenSource.Cancel();
                 _client.Client.Disconnect(false);
-                if (OnConnectionStateChange != null)
-                    OnConnectionStateChange(ConnectionStateChange.Disconnected);
+                OnConnectionStateChange?.Invoke(ConnectionStateChange.Disconnected);
             }
 
             _client.Close();
@@ -247,64 +248,103 @@ namespace RCONServerLib
             catch (IOException) { } // Do not write to Socket when it's closed.
         }
 
-        /// <summary>
-        /// </summary>
-        /// <param name="result"></param>
-        private void OnPacket(IAsyncResult result)
+        internal async Task ListenToNetworkStreamAsync(CancellationToken cancellationToken)
         {
-            try
+            while (!cancellationToken.IsCancellationRequested)
             {
-                var bytesRead = _ns.EndRead(result);
-                if (!_client.Connected)
+                try
                 {
-                    if (OnConnectionStateChange != null)
-                        OnConnectionStateChange(ConnectionStateChange.ConnectionLost);
+                    if (!await ReadFixedAmountAsync(_sizeBuffer, 0, 4, cancellationToken))
+                        return;
+
+                    int size = BinaryReaderExt.ToInt32LittleEndian(_sizeBuffer);
+                    var packet = new byte[size];
+
+                    if (!await ReadFixedAmountAsync(packet, 0, size, cancellationToken))
+                        return;
+
+                    ParsePacket(size, packet);
+                }
+                catch (TimeoutException) { }
+                catch (ObjectDisposedException)
+                {
+                    OnConnectionStateChange?.Invoke(ConnectionStateChange.ConnectionLost);
+                    Disconnect();
                     return;
                 }
-
-                if (bytesRead == 0)
+                catch (IOException)
                 {
-                    _buffer = new byte[MaxAllowedPacketSize];
-                    _ns.BeginRead(_buffer, 0, MaxAllowedPacketSize, OnPacket, null);
+                    OnConnectionStateChange?.Invoke(ConnectionStateChange.ConnectionLost);
+                    Disconnect();
                     return;
                 }
-
-                Array.Resize(ref _buffer, bytesRead);
-
-                ParsePacket(_buffer);
-
-                if (!_client.Connected)
+                catch (Exception e)
                 {
-                    if (OnConnectionStateChange != null)
-                        OnConnectionStateChange(ConnectionStateChange.ConnectionLost);
+                    Log(e.ToString());
                     return;
                 }
+            }
+        }
 
-                _buffer = new byte[MaxAllowedPacketSize];
-                _ns.BeginRead(_buffer, 0, MaxAllowedPacketSize, OnPacket, null);
-            }
-            catch (IOException)
+        /// <summary>
+        /// <para>Continuously reads bytes from <see cref="_ns"/> until it read exactly <paramref name="count"/> amount of bytes</para>
+        /// <para>If it started receiving bytes and doesn't receive enough bytes within
+        /// <see cref="ReadFixedAmountTimeoutMs"/> a <see cref="TimeoutException"/> will be thrown</para>
+        /// </summary>
+        /// <param name="buffer"></param>
+        /// <param name="offset"></param>
+        /// <param name="count"></param>
+        /// <param name="cancellationToken"></param>
+        /// <exception cref="TimeoutException"/>
+        /// <returns><see langword="true"/> unless connection times out or cancellation is
+        /// requested through the token both of which will also abort execution</returns>
+        internal async Task<bool> ReadFixedAmountAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            int actualCount = 0;
+            int currentOffset = offset;
+            DateTime? startTime = null;
+            do
             {
-                if (OnConnectionStateChange != null)
-                    OnConnectionStateChange(ConnectionStateChange.ConnectionLost);
-                Disconnect();
+                int readCount = await _ns.ReadAsync(buffer, currentOffset, count - actualCount, cancellationToken);
+                if (cancellationToken.IsCancellationRequested || LostConnection())
+                    return false;
+                if (startTime.HasValue)
+                {
+                    if (DateTime.Now - startTime > TimeSpan.FromMilliseconds(ReadFixedAmountTimeoutMs))
+                        throw new TimeoutException($"Expected to receive {count} bytes but only got {actualCount} after {ReadFixedAmountTimeoutMs}ms.");
+                }
+                else
+                    startTime = DateTime.Now;
+                actualCount += readCount;
+                currentOffset += readCount;
             }
-            catch (Exception e)
+            while (actualCount < count);
+            return true;
+        }
+
+        /// <summary>
+        /// Did we loose connection?
+        /// </summary>
+        /// <returns></returns>
+        internal bool LostConnection()
+        {
+            if (!_client.Connected)
             {
-                Console.WriteLine(e);
-                Log(e.ToString());
+                OnConnectionStateChange?.Invoke(ConnectionStateChange.ConnectionLost);
+                return true;
             }
+            return false;
         }
 
         /// <summary>
         ///     Parses raw bytes to RemoteConPacket
         /// </summary>
         /// <param name="rawPacket"></param>
-        internal void ParsePacket(byte[] rawPacket)
+        internal void ParsePacket(int size, byte[] rawPacket)
         {
             try
             {
-                var packet = new RemoteConPacket(rawPacket, UseUTF8);
+                var packet = new RemoteConPacket(rawPacket, UseUTF8, size);
                 if (!Authenticated)
                 {
                     // ExecCommand is AuthResponse too.
@@ -321,8 +361,7 @@ namespace RCONServerLib
                             Authenticated = true;
                         }
 
-                        if (OnAuthResult != null)
-                            OnAuthResult(Authenticated);
+                        OnAuthResult?.Invoke(Authenticated);
                     }
 
                     return;

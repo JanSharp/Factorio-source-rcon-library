@@ -10,8 +10,8 @@ namespace ClientExample
         public static void Main(string[] args)
         {
             var ip = "127.0.0.1";
-            var port = 27015;
-            var password = "changeme";
+            var port = 25575;
+            var password = "password";
             if (args.Length == 3)
             {
                 ip = args[0];
@@ -19,13 +19,13 @@ namespace ClientExample
                 password = args[2];
             }
 
-            var client = new RemoteConClient();
+            var client = new RemoteConClient() { UseUTF8 = true };
             client.OnLog += message => { Console.WriteLine(string.Format("Client Log: {0}", message)); };
             client.OnAuthResult += result => { _authProcessed = true; };
             client.OnConnectionStateChange += state =>
             {
                 Console.WriteLine("Connection changed: " + state);
-                if (state == 0)
+                if (state == RemoteConClient.ConnectionStateChange.Connected)
                 {
                     client.Authenticate(password);
                 }
@@ -57,7 +57,7 @@ namespace ClientExample
                 if (cmd == "exit" || cmd == "quit")
                 {
                     client.Disconnect();
-                    return;
+                    break;
                 }
 
                 client.SendCommand(cmd, result => { Console.WriteLine("CMD Result: " + result); });
